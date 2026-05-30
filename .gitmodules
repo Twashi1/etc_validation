@@ -1,0 +1,3 @@
+[submodule "ext/dynamorio"]
+	path = ext/dynamorio
+	url = https://github.com/DynamoRIO/dynamorio.git
