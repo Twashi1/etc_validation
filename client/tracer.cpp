@@ -2,6 +2,7 @@
 #include "dr_tools.h"
 #include "drmgr.h"
 
+#include <atomic>
 #include <linux/perf_event.h>
 #include <stdint.h>
 #include <string.h>
@@ -14,8 +15,10 @@ struct accumulated_stats_t {
   uint64_t instr;
   uint64_t reg_reads;
   uint64_t reg_writes;
+  uint64_t instr_per_sample; // actual instructions traversed, not executed
 
-  accumulated_stats_t() : cycles(0), instr(0), reg_reads(0), reg_writes(0) {}
+  accumulated_stats_t()
+      : cycles(0), instr(0), reg_reads(0), reg_writes(0), instr_per_sample(0) {}
 };
 
 struct per_thread_t {
@@ -25,6 +28,7 @@ struct per_thread_t {
   accumulated_stats_t stats;
 };
 
+static const uint64_t INSTR_SAMPLE_THRESHOLD = 1000;
 static const bool PRINT_PER_INSTR = false;
 
 static int tls_idx;
@@ -117,11 +121,28 @@ static void event_thread_init(void *drcontext) {
   drmgr_set_tls_field(drcontext, tls_idx, t);
 }
 
+static void dump_stats(per_thread_t *t, const char *tag) {
+  // TODO: unsure if should use deltas or should just read value
+  if (t->cycles_fd >= 0)
+    read(t->cycles_fd, &t->stats.cycles, sizeof(uint64_t));
+
+  if (t->instr_fd >= 0)
+    read(t->instr_fd, &t->stats.instr, sizeof(uint64_t));
+
+  dr_fprintf(STDERR, "[%s] cycles=%llu instr=%llu regs(r=%llu w=%llu)\n", tag,
+             (unsigned long long)t->stats.cycles,
+             (unsigned long long)t->stats.instr,
+             (unsigned long long)t->stats.reg_reads,
+             (unsigned long long)t->stats.reg_writes);
+}
+
 static void event_thread_exit(void *drcontext) {
   per_thread_t *t = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
   if (!t)
     return;
+
+  dump_stats(t, "FINAL");
 
   if (t->cycles_fd >= 0)
     close(t->cycles_fd);
@@ -136,35 +157,20 @@ static dr_emit_flags_t event_bb(void *drcontext, void *tag, instrlist_t *bb,
                                 bool translating, void *user_data) {
   per_thread_t *t = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
-  accumulated_stats_t prev = t->stats;
-
-  if (t->cycles_fd >= 0)
-    read(t->cycles_fd, &t->stats.cycles, sizeof(uint64_t));
-
-  if (t->instr_fd >= 0)
-    read(t->instr_fd, &t->stats.instr, sizeof(uint64_t));
-
-  if (t->cycles_fd < 0 || t->instr_fd < 0)
-    dr_fprintf(STDERR, "File descriptors were null cycles=%lli instr=%lli\n",
-               (long long)t->cycles_fd, (long long)t->instr_fd);
-
   for (instr_t *ins = instrlist_first_app(bb); ins != NULL;
        ins = instr_get_next_app(ins)) {
     count_regs(t, ins);
+    t->stats.instr_per_sample++;
 
     if (PRINT_PER_INSTR)
       dr_fprintf(STDERR, "pc=%p op=%s\n", instr_get_app_pc(ins),
                  decode_opcode_name(instr_get_opcode(ins)));
   }
 
-  uint64_t dcycles = t->stats.cycles - prev.cycles;
-  uint64_t dinstr = t->stats.instr - prev.instr;
-  uint64_t dreg_reads = t->stats.reg_reads - prev.reg_reads;
-  uint64_t dreg_writes = t->stats.reg_writes - prev.reg_writes;
-
-  dr_fprintf(STDERR, "[BB] cycles=%llu instr=%llu regs(r=%llu w=%llu)\n",
-             (unsigned long long)dcycles, (unsigned long long)dinstr,
-             (unsigned long long)dreg_reads, (unsigned long long)dreg_writes);
+  if (t->stats.instr_per_sample >= INSTR_SAMPLE_THRESHOLD) {
+    dump_stats(t, "SAMPLE");
+    t->stats.instr_per_sample = 0;
+  }
 
   return DR_EMIT_DEFAULT;
 }
