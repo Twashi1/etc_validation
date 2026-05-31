@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 
+TARGET=${1:-1}
+ORIG=$(cat /proc/sys/kernel/perf_event_paranoid)
+
+echo "original kernel.perf_event_paranoid = $ORIG"
+echo "setting kernel.perf_event_paranoid = $TARGET"
+
+sudo sysctl -w kernel.perf_event_paranoid="$TARGET" >/dev/null
+
+cleanup() {
+    echo "restoring kernel.perf_event_paranoid = $ORIG"
+    sudo sysctl -w kernel.perf_event_paranoid="$ORIG" >/dev/null
+}
+
+trap cleanup EXIT INT TERM
+
 set -e
 
 DR_ROOT="$(pwd)/ext/dynamorio"
