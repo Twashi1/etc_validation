@@ -11,14 +11,26 @@
 #include <unistd.h>
 
 struct accumulated_stats_t {
-  uint64_t cycles;
-  uint64_t instr;
-  uint64_t reg_reads;
-  uint64_t reg_writes;
-  uint64_t instr_per_sample; // actual instructions traversed, not executed
+  uint64_t cycles{0};
+  uint64_t instr{0};
+  uint64_t reg_reads{0};
+  uint64_t reg_writes{0};
+  uint64_t instr_per_sample{0}; // actual instructions traversed, not executed
 
-  accumulated_stats_t()
-      : cycles(0), instr(0), reg_reads(0), reg_writes(0), instr_per_sample(0) {}
+  // TODO: these stats are of instructions traversed not executed; executed is
+  // more useful for power analysis Not a full list of all categories, but
+  // probably the main ones we care about
+  uint64_t category_fp{0};
+  uint64_t category_load{0};
+  uint64_t category_store{0};
+  uint64_t category_branch{0};
+};
+
+// TODO: should consider attaching stats of each instruction type within the bb
+struct bb_metadata_t {
+  uint64_t exec_count{0};
+  void *tag{nullptr};
+  uint32_t id{0};
 };
 
 struct per_thread_t {
@@ -30,8 +42,79 @@ struct per_thread_t {
 
 static const uint64_t INSTR_SAMPLE_THRESHOLD = 1000;
 static const bool PRINT_PER_INSTR = false;
+static std::atomic<uint64_t> bb_id_counter{0};
+static constexpr uint64_t BB_TABLE_SIZE = 8192;
+static bb_metadata_t bb_table[BB_TABLE_SIZE];
+
+static inline uint64_t hash_tag(void *tag) {
+  uintptr_t h = reinterpret_cast<uintptr_t>(tag);
+
+  // murmur64 hash
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  h *= 0xc4ceb9fe1a85ec53ULL;
+  h ^= h >> 33;
+
+  // relies on BB_TABLE_SIZE being power of 2
+  return h & (BB_TABLE_SIZE - 1);
+}
+
+static bb_metadata_t *get_or_make_bb_state(void *tag) {
+  uint64_t idx = hash_tag(tag);
+  // TODO: check math here
+
+  for (uint64_t max_search_count = BB_TABLE_SIZE - 1; max_search_count > 0;
+       max_search_count--) {
+    bb_metadata_t *slot = &bb_table[idx];
+
+    if (slot->tag == nullptr) {
+      slot->tag = tag;
+      slot->id = bb_id_counter.fetch_add(1, std::memory_order_relaxed);
+      return slot;
+    }
+
+    if (slot->tag == tag)
+      return slot;
+
+    // simple linear probing
+    idx = (idx + 1) & (BB_TABLE_SIZE - 1);
+  }
+
+  return nullptr;
+}
+
+static bb_metadata_t *get_bb_state(void *tag) {
+  uint64_t idx = hash_tag(tag);
+
+  for (uint64_t max_search_count = BB_TABLE_SIZE - 1; max_search_count > 0;
+       max_search_count--) {
+    bb_metadata_t *slot = &bb_table[idx];
+
+    if (slot->tag == nullptr)
+      return nullptr;
+    if (slot->tag == tag)
+      return slot;
+
+    idx = (idx + 1) & (BB_TABLE_SIZE - 1);
+  }
+
+  return nullptr;
+}
 
 static int tls_idx;
+
+static void increment_categories_of_instr(accumulated_stats_t *stats,
+                                          instr_t *ins) {
+  if (instr_is_cbr(ins) || instr_is_ubr(ins))
+    stats->category_branch++;
+  if (instr_is_floating(ins))
+    stats->category_fp++;
+  if (instr_reads_memory(ins))
+    stats->category_load++;
+  if (instr_writes_memory(ins))
+    stats->category_store++;
+}
 
 static long perf_event_open(struct perf_event_attr *pe, pid_t pid, int cpu,
                             int group_fd, unsigned long flags) {
@@ -157,9 +240,13 @@ static dr_emit_flags_t event_bb(void *drcontext, void *tag, instrlist_t *bb,
                                 bool translating, void *user_data) {
   per_thread_t *t = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
+  bb_metadata_t *bb_state = get_or_make_bb_state(tag);
+  bb_state->exec_count++;
+
   for (instr_t *ins = instrlist_first_app(bb); ins != NULL;
        ins = instr_get_next_app(ins)) {
     count_regs(t, ins);
+    increment_categories_of_instr(&t->stats, ins);
     t->stats.instr_per_sample++;
 
     if (PRINT_PER_INSTR)
@@ -169,6 +256,8 @@ static dr_emit_flags_t event_bb(void *drcontext, void *tag, instrlist_t *bb,
 
   if (t->stats.instr_per_sample >= INSTR_SAMPLE_THRESHOLD) {
     dump_stats(t, "SAMPLE");
+    dr_fprintf(STDERR, "[BB_ADD] tag=%p exec_count=%llu\n",
+               (void *)bb_state->tag, (unsigned long long)bb_state->exec_count);
     t->stats.instr_per_sample = 0;
   }
 
