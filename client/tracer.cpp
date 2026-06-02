@@ -1,29 +1,26 @@
 #include "dr_api.h"
+#include "dr_ir_instrlist.h"
 #include "dr_tools.h"
 #include "drmgr.h"
 
 #include <atomic>
 #include <linux/perf_event.h>
+#include <mutex>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
-struct accumulated_stats_t {
-  uint64_t cycles{0};
-  uint64_t instr{0};
-  uint64_t reg_reads{0};
-  uint64_t reg_writes{0};
-  uint64_t instr_per_sample{0}; // actual instructions traversed, not executed
-
-  // TODO: these stats are of instructions traversed not executed; executed is
-  // more useful for power analysis Not a full list of all categories, but
-  // probably the main ones we care about
-  uint64_t category_fp{0};
-  uint64_t category_load{0};
-  uint64_t category_store{0};
-  uint64_t category_branch{0};
+// TODO: goal is to collect stats per basic block (static)
+// - then collect the order of BB execution (can't without highly expensive
+// instrumentation)
+// - and also collect PMCs on some period
+struct pmc_stats_t {
+  // Actual stats (cumulative)
+  uint64_t cycles;
+  uint64_t instrs;
+  uint16_t callee_bb;
 };
 
 // TODO: should consider attaching stats of each instruction type within the bb
@@ -31,20 +28,36 @@ struct bb_metadata_t {
   uint64_t exec_count{0};
   void *tag{nullptr};
   uint32_t id{0};
+
+  // Note these are per basic block execution
+  // Multiply by execution count to get real executed instructions
+  uint32_t instr_count{0};
+  uint32_t reg_reads{0};
+  uint32_t reg_writes{0};
+
+  uint32_t category_fp{0};
+  uint32_t category_load{0};
+  uint32_t category_store{0};
+  uint32_t category_branch{0};
 };
 
 struct per_thread_t {
+  // File descriptors of PMCs
   int cycles_fd;
   int instr_fd;
-
-  accumulated_stats_t stats;
 };
 
-static const uint64_t INSTR_SAMPLE_THRESHOLD = 1000;
-static const bool PRINT_PER_INSTR = false;
-static std::atomic<uint64_t> bb_id_counter{0};
-static constexpr uint64_t BB_TABLE_SIZE = 8192;
-static bb_metadata_t bb_table[BB_TABLE_SIZE];
+// BB table map structure
+// TODO: wrap into a class
+static std::atomic<uint16_t> bb_id_counter{0};
+static constexpr uint64_t BB_TABLE_SIZE{8192};
+static bb_metadata_t bb_table[BB_TABLE_SIZE] = {0};
+static std::mutex bb_table_mutex;
+
+static constexpr uint64_t PMC_LIST_SIZE{65536};
+static pmc_stats_t pmc_reads[PMC_LIST_SIZE] = {0};
+
+static int tls_idx;
 
 static inline uint64_t hash_tag(void *tag) {
   uintptr_t h = reinterpret_cast<uintptr_t>(tag);
@@ -64,6 +77,8 @@ static bb_metadata_t *get_or_make_bb_state(void *tag) {
   uint64_t idx = hash_tag(tag);
   // TODO: check math here
 
+  std::scoped_lock table_lock{bb_table_mutex};
+
   for (uint64_t max_search_count = BB_TABLE_SIZE - 1; max_search_count > 0;
        max_search_count--) {
     bb_metadata_t *slot = &bb_table[idx];
@@ -80,6 +95,8 @@ static bb_metadata_t *get_or_make_bb_state(void *tag) {
     // simple linear probing
     idx = (idx + 1) & (BB_TABLE_SIZE - 1);
   }
+
+  dr_fprintf(STDERR, "Ran out of BB slots\n");
 
   return nullptr;
 }
@@ -102,10 +119,7 @@ static bb_metadata_t *get_bb_state(void *tag) {
   return nullptr;
 }
 
-static int tls_idx;
-
-static void increment_categories_of_instr(accumulated_stats_t *stats,
-                                          instr_t *ins) {
+static void increment_categories_of_instr(bb_metadata_t *stats, instr_t *ins) {
   if (instr_is_cbr(ins) || instr_is_ubr(ins))
     stats->category_branch++;
   if (instr_is_floating(ins))
@@ -114,6 +128,9 @@ static void increment_categories_of_instr(accumulated_stats_t *stats,
     stats->category_load++;
   if (instr_writes_memory(ins))
     stats->category_store++;
+  // TODO: check opcode to determine other facts
+
+  stats->instr_count++;
 }
 
 static long perf_event_open(struct perf_event_attr *pe, pid_t pid, int cpu,
@@ -121,7 +138,7 @@ static long perf_event_open(struct perf_event_attr *pe, pid_t pid, int cpu,
   return syscall(__NR_perf_event_open, pe, pid, cpu, group_fd, flags);
 }
 
-static void count_regs(per_thread_t *t, instr_t *ins) {
+static void count_regs(bb_metadata_t *stats, instr_t *ins) {
   int i, n;
 
   // Number of source registers
@@ -129,7 +146,7 @@ static void count_regs(per_thread_t *t, instr_t *ins) {
   for (i = 0; i < n; i++) {
     opnd_t op = instr_get_src(ins, i);
     if (opnd_is_reg(op))
-      t->stats.reg_reads++;
+      stats->reg_reads++;
   }
 
   // Number of destination registers
@@ -137,7 +154,7 @@ static void count_regs(per_thread_t *t, instr_t *ins) {
   for (i = 0; i < n; i++) {
     opnd_t op = instr_get_dst(ins, i);
     if (opnd_is_reg(op))
-      t->stats.reg_writes++;
+      stats->reg_writes++;
   }
 }
 
@@ -199,24 +216,23 @@ static void event_thread_init(void *drcontext) {
 
   t->cycles_fd = open_counter(PERF_COUNT_HW_CPU_CYCLES);
   t->instr_fd = open_counter(PERF_COUNT_HW_INSTRUCTIONS);
-  t->stats = accumulated_stats_t{};
 
   drmgr_set_tls_field(drcontext, tls_idx, t);
 }
 
 static void dump_stats(per_thread_t *t, const char *tag) {
-  // TODO: unsure if should use deltas or should just read value
+  uint64_t cycles{0};
+  uint64_t instrs{0};
+
   if (t->cycles_fd >= 0)
-    read(t->cycles_fd, &t->stats.cycles, sizeof(uint64_t));
+    read(t->cycles_fd, &cycles, sizeof(uint64_t));
 
   if (t->instr_fd >= 0)
-    read(t->instr_fd, &t->stats.instr, sizeof(uint64_t));
+    read(t->instr_fd, &instrs, sizeof(uint64_t));
 
-  dr_fprintf(STDERR, "[%s] cycles=%llu instr=%llu regs(r=%llu w=%llu)\n", tag,
-             (unsigned long long)t->stats.cycles,
-             (unsigned long long)t->stats.instr,
-             (unsigned long long)t->stats.reg_reads,
-             (unsigned long long)t->stats.reg_writes);
+  dr_fprintf(STDERR, "[%s] cycles=%llu instr=%llu\n", tag,
+             static_cast<unsigned long long>(cycles),
+             static_cast<unsigned long long>(instrs));
 }
 
 static void event_thread_exit(void *drcontext) {
@@ -227,6 +243,46 @@ static void event_thread_exit(void *drcontext) {
 
   dump_stats(t, "FINAL");
 
+  // Calculate approximate instruction mix
+  // TODO: dense hash map data structure would be ideal
+  uint64_t est_instruction = 0;
+  uint64_t est_floating = 0;
+  uint64_t est_load = 0;
+  uint64_t est_store = 0;
+  uint64_t est_branch = 0;
+  uint64_t est_reg_reads = 0;
+  uint64_t est_reg_writes = 0;
+  uint64_t block_count = 0;
+
+  for (uint64_t i = 0; i < BB_TABLE_SIZE; i++) {
+    if (bb_table[i].tag == nullptr)
+      continue;
+
+    ++block_count;
+
+    bb_metadata_t *state = &bb_table[i];
+
+    est_instruction += state->instr_count * state->exec_count;
+    est_floating += state->category_fp * state->exec_count;
+    est_load += state->category_load * state->exec_count;
+    est_store += state->category_store * state->exec_count;
+    est_branch += state->category_branch * state->exec_count;
+    est_reg_reads += state->reg_reads * state->exec_count;
+    est_reg_writes += state->reg_writes * state->exec_count;
+
+    dr_fprintf(STDERR, "[BB_OUT] tag: %p, exec count: %llu\n",
+               (void *)state->tag, (unsigned long long)state->exec_count);
+  }
+
+  dr_fprintf(
+      STDERR,
+      "Total block count: %llu, est instr: %llu, est float: %llu, reg "
+      "reads: %llu, reg writes: %llu\n",
+      (unsigned long long)block_count, (unsigned long long)est_instruction,
+      (unsigned long long)est_floating, (unsigned long long)est_reg_reads,
+      (unsigned long long)est_reg_writes);
+
+  // Cleanup PMCs
   if (t->cycles_fd >= 0)
     close(t->cycles_fd);
   if (t->instr_fd >= 0)
@@ -235,31 +291,45 @@ static void event_thread_exit(void *drcontext) {
   dr_thread_free(drcontext, t, sizeof(per_thread_t));
 }
 
-static dr_emit_flags_t event_bb(void *drcontext, void *tag, instrlist_t *bb,
-                                instr_t *instr, bool for_trace,
-                                bool translating, void *user_data) {
+static dr_emit_flags_t event_bb_analysis(void *drcontext, void *tag,
+                                         instrlist_t *bb, bool for_trace,
+                                         bool translating, void **user_data) {
   per_thread_t *t = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
   bb_metadata_t *bb_state = get_or_make_bb_state(tag);
-  bb_state->exec_count++;
 
   for (instr_t *ins = instrlist_first_app(bb); ins != NULL;
        ins = instr_get_next_app(ins)) {
-    count_regs(t, ins);
-    increment_categories_of_instr(&t->stats, ins);
-    t->stats.instr_per_sample++;
-
-    if (PRINT_PER_INSTR)
-      dr_fprintf(STDERR, "pc=%p op=%s\n", instr_get_app_pc(ins),
-                 decode_opcode_name(instr_get_opcode(ins)));
+    count_regs(bb_state, ins);
+    increment_categories_of_instr(bb_state, ins);
   }
 
-  if (t->stats.instr_per_sample >= INSTR_SAMPLE_THRESHOLD) {
-    dump_stats(t, "SAMPLE");
-    dr_fprintf(STDERR, "[BB_ADD] tag=%p exec_count=%llu\n",
-               (void *)bb_state->tag, (unsigned long long)bb_state->exec_count);
-    t->stats.instr_per_sample = 0;
-  }
+  return DR_EMIT_DEFAULT;
+}
+
+static dr_emit_flags_t event_bb_insertion(void *drcontext, void *tag,
+                                          instrlist_t *bb, instr_t *instr,
+                                          bool for_trace, bool translating,
+                                          void *user_data) {
+  instr_t *first = instrlist_first_app(bb);
+  if (first == NULL)
+    return DR_EMIT_DEFAULT;
+
+  bb_metadata_t *bb_state = get_or_make_bb_state(tag);
+
+  // instr_t *inc = INSTR_CREATE_add(
+  //     drcontext, OPND_CREATE_ABSMEM(&bb_state->exec_count, OPSZ_8),
+  //     OPND_CREATE_INT8(1));
+
+  instr_t *inc2 = INSTR_CREATE_inc(
+      drcontext, OPND_CREATE_ABSMEM(&bb_state->exec_count, OPSZ_8));
+
+  instrlist_meta_preinsert(bb, instrlist_first(bb), inc2);
+
+  // NOTE: previously we inserted a call to get PMCs here
+  // but afaik, that PMC would include a lot of the overhead of DynamoRIO, since
+  // it runs at instrumentation of the BB it also would've only executed once
+  // per basic block
 
   return DR_EMIT_DEFAULT;
 }
@@ -274,5 +344,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[]) {
   drmgr_register_thread_init_event(event_thread_init);
   drmgr_register_thread_exit_event(event_thread_exit);
 
-  drmgr_register_bb_instrumentation_event(NULL, event_bb, NULL);
+  drmgr_register_bb_instrumentation_event(event_bb_analysis, event_bb_insertion,
+                                          NULL);
 }
